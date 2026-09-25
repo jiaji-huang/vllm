@@ -440,6 +440,11 @@ class SpecDecodeBaseProposer:
 
     def _greedy_sample(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Greedy-sample draft tokens from hidden states."""
+        if (
+            not self.use_heterogeneous_vocab
+            and getattr(self.model, "masked_embedding", None) is not None
+        ):
+            return self.model.get_top_tokens(hidden_states)
         if self.use_local_argmax_reduction:
             return self.model.get_top_tokens(hidden_states)
         if self.use_heterogeneous_vocab:
@@ -1575,6 +1580,14 @@ class SpecDecodeBaseProposer:
                         logger.info(
                             "Shared target model lm_head with MTP shared_head.head."
                         )
+
+            prepare_clustered_lm_head = getattr(
+                self.model,
+                "prepare_clustered_lm_head",
+                None,
+            )
+            if prepare_clustered_lm_head is not None:
+                prepare_clustered_lm_head()
 
         if hasattr(target_language_model.model, "topk_indices_buffer"):
             target_buffer = target_language_model.model.topk_indices_buffer

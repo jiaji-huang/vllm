@@ -169,6 +169,13 @@ if TYPE_CHECKING:
     VLLM_SERVER_DEV_MODE: bool = False
     VLLM_V1_OUTPUT_PROC_CHUNK_SIZE: int = 128
     VLLM_MLA_DISABLE: bool = False
+    VLLM_GEMMA4_MTP_SPARSE_HEAD_BACKEND: str = "gather"
+    VLLM_NEMOTRON_MTP_CLUSTERED_LM_HEAD: bool = False
+    VLLM_NEMOTRON_MTP_LM_HEAD_NUM_CLUSTERS: int = 1024
+    VLLM_NEMOTRON_MTP_LM_HEAD_CLUSTER_TOP_K: int = 1
+    VLLM_NEMOTRON_MTP_CLUSTERED_LM_HEAD_PATH: str | None = None
+    VLLM_NEMOTRON_MTP_LM_HEAD_IMPL: str = "moe"
+    VLLM_NEMOTRON_MTP_SPARSE_HEAD_BACKEND: str = "moe"
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
     VLLM_RAY_BUNDLE_INDICES: str = ""
     VLLM_CUDART_SO_PATH: str | None = None
@@ -1438,6 +1445,49 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # If set, vLLM will disable the MLA attention optimizations.
     "VLLM_MLA_DISABLE": lambda: bool(int(os.getenv("VLLM_MLA_DISABLE", "0"))),
+    # Backend for the Gemma4 MTP centroid-masked sparse LM head.
+    # "gather": scattered row gather + einsum (original).
+    # "moe": centroid-major weight layout + fused_moe grouped GEMM.
+    # Experimental A/B knob; benchmark with
+    # benchmarks/kernels/benchmark_gemma4_mtp_sparse_head.py.
+    "VLLM_GEMMA4_MTP_SPARSE_HEAD_BACKEND": lambda: os.getenv(
+        "VLLM_GEMMA4_MTP_SPARSE_HEAD_BACKEND", "gather"
+    ).lower(),
+    # Enable the Nemotron-H MTP centroid-masked sparse LM head.
+    "VLLM_NEMOTRON_MTP_CLUSTERED_LM_HEAD": lambda: bool(
+        int(os.getenv("VLLM_NEMOTRON_MTP_CLUSTERED_LM_HEAD", "0"))
+    ),
+    # Number of equal-size vocabulary clusters for Nemotron-H MTP.
+    "VLLM_NEMOTRON_MTP_LM_HEAD_NUM_CLUSTERS": lambda: int(
+        os.getenv("VLLM_NEMOTRON_MTP_LM_HEAD_NUM_CLUSTERS", "1024")
+    ),
+    # Number of centroids selected before sparse token scoring.
+    "VLLM_NEMOTRON_MTP_LM_HEAD_CLUSTER_TOP_K": lambda: int(
+        os.getenv("VLLM_NEMOTRON_MTP_LM_HEAD_CLUSTER_TOP_K", "1")
+    ),
+    # Optional sidecar checkpoint for learned Nemotron-H MTP clustered-head
+    # centroids and token ordering. Can point at a .pt/.bin file or a
+    # directory containing model.pt, pytorch_model.bin, or model.safetensors.
+    "VLLM_NEMOTRON_MTP_CLUSTERED_LM_HEAD_PATH": lambda: os.getenv(
+        "VLLM_NEMOTRON_MTP_CLUSTERED_LM_HEAD_PATH"
+    ),
+    # Older bench-job alias for the sparse-head backend.
+    "VLLM_NEMOTRON_MTP_LM_HEAD_IMPL": lambda: os.getenv(
+        "VLLM_NEMOTRON_MTP_LM_HEAD_IMPL", "moe"
+    ).lower(),
+    # Backend for the Nemotron-H MTP centroid-masked sparse LM head.
+    # "gather": scattered row gather + einsum.
+    # "moe": centroid-major weight layout + fused_moe grouped GEMM.
+    # VLLM_NEMOTRON_MTP_LM_HEAD_IMPL is kept as the older bench-job alias;
+    # "auto"/"triton" map to the MoE-backed Triton grouped GEMM here.
+    "VLLM_NEMOTRON_MTP_SPARSE_HEAD_BACKEND": lambda: (
+        lambda backend: "moe" if backend in ("auto", "triton") else backend
+    )(
+        os.getenv(
+            "VLLM_NEMOTRON_MTP_SPARSE_HEAD_BACKEND",
+            os.getenv("VLLM_NEMOTRON_MTP_LM_HEAD_IMPL", "moe"),
+        ).lower()
+    ),
     # If set, vLLM will pick up the provided Flash Attention MLA
     # Number of GPUs per worker in Ray, if it is set to be a fraction,
     # it allows ray to schedule multiple actors on a single GPU,
