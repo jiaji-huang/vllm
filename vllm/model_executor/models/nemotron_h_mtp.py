@@ -15,6 +15,7 @@ from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.parallel import ParallelConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
@@ -630,19 +631,24 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
                     f"1 and num_clusters, got {top_k=} and {num_clusters=}."
                 )
 
-            self.masked_embedding = Gemma4MTPMaskedEmbedder(
-                hidden_size=self.config.hidden_size,
-                vocab_size=self.config.vocab_size,
-                num_centroids=num_clusters,
-                centroid_intermediate_top_k=top_k,
-                prefix=maybe_prefix(prefix, "masked_embedding"),
-            ).to(dtype=vllm_config.model_config.dtype)
             backend = envs.VLLM_NEMOTRON_MTP_SPARSE_HEAD_BACKEND
             if backend not in ("gather", "moe"):
                 raise ValueError(
                     "VLLM_NEMOTRON_MTP_SPARSE_HEAD_BACKEND must be "
                     f"'gather' or 'moe', got {backend!r}."
                 )
+            tp_size = get_tensor_model_parallel_world_size()
+            tp_rank = get_tp_group().rank_in_group
+            shard_centroid_weight = backend == "moe" and tp_size > 1
+            self.masked_embedding = Gemma4MTPMaskedEmbedder(
+                hidden_size=self.config.hidden_size,
+                vocab_size=self.config.vocab_size,
+                num_centroids=num_clusters,
+                centroid_intermediate_top_k=top_k,
+                prefix=maybe_prefix(prefix, "masked_embedding"),
+                centroid_shard_rank=tp_rank if shard_centroid_weight else 0,
+                centroid_shard_size=tp_size if shard_centroid_weight else 1,
+            ).to(dtype=vllm_config.model_config.dtype)
             self.masked_embedding.use_moe_backend = backend == "moe"
             self.masked_embedding.centroids.requires_grad_(False)
             self.masked_embedding.token_ordering.copy_(
@@ -654,12 +660,13 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
             logger.info(
                 "Nemotron-H MTP: clustered LM head enabled "
                 "(num_clusters=%d, top_k=%d, active_tokens=%d/%d, "
-                "backend=%s).",
+                "backend=%s, cluster_parallel_size=%d).",
                 num_clusters,
                 top_k,
                 top_k * (self.config.vocab_size // num_clusters),
                 self.config.vocab_size,
                 backend,
+                self.masked_embedding.centroid_shard_size,
             )
         else:
             self.masked_embedding = None
@@ -724,18 +731,58 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
             return
 
         masked_embedding.centroid_weight = None
-        lm_head_weight = self._get_full_lm_head_weight()
         vocab_size_per_centroid = masked_embedding.vocab_size_per_centroid
+        sidecar_loaded = _load_clustered_lm_head_sidecar(masked_embedding)
+        if masked_embedding.centroid_weight_is_sharded:
+            lm_head_weight = self.lm_head.weight
+        else:
+            lm_head_weight = self._get_full_lm_head_weight()
 
-        if not _load_clustered_lm_head_sidecar(masked_embedding):
+        if not sidecar_loaded:
             with torch.no_grad():
-                for centroid_idx in range(masked_embedding.num_centroids):
-                    start = centroid_idx * vocab_size_per_centroid
-                    end = start + vocab_size_per_centroid
-                    masked_embedding.centroids.weight[centroid_idx].copy_(
-                        lm_head_weight[start:end].mean(dim=0)
+                if masked_embedding.centroid_weight_is_sharded:
+                    vocab_start = self.lm_head.shard_indices.org_vocab_start_index
+                    vocab_end = self.lm_head.shard_indices.org_vocab_end_index
+                    token_to_cluster = torch.empty(
+                        masked_embedding.vocab_size,
+                        dtype=torch.long,
+                        device=lm_head_weight.device,
                     )
-        masked_embedding.build_centroid_weight(lm_head_weight)
+                    flat_ordering = masked_embedding.token_ordering.reshape(-1)
+                    token_to_cluster[flat_ordering] = torch.arange(
+                        masked_embedding.num_centroids,
+                        device=lm_head_weight.device,
+                    ).repeat_interleave(vocab_size_per_centroid)
+                    local_token_ids = torch.arange(
+                        vocab_start, vocab_end, device=lm_head_weight.device
+                    )
+                    centroid_sums = torch.zeros_like(
+                        masked_embedding.centroids.weight
+                    )
+                    centroid_sums.index_add_(
+                        0,
+                        token_to_cluster[local_token_ids],
+                        lm_head_weight[: vocab_end - vocab_start],
+                    )
+                    centroid_sums = get_tp_group().all_reduce(centroid_sums)
+                    masked_embedding.centroids.weight.copy_(
+                        centroid_sums / vocab_size_per_centroid
+                    )
+                else:
+                    for centroid_idx in range(masked_embedding.num_centroids):
+                        start = centroid_idx * vocab_size_per_centroid
+                        end = start + vocab_size_per_centroid
+                        masked_embedding.centroids.weight[centroid_idx].copy_(
+                            lm_head_weight[start:end].mean(dim=0)
+                        )
+        if masked_embedding.centroid_weight_is_sharded:
+            masked_embedding.build_sharded_centroid_weight(
+                lm_head_weight,
+                vocab_start=self.lm_head.shard_indices.org_vocab_start_index,
+                vocab_end=self.lm_head.shard_indices.org_vocab_end_index,
+            )
+        else:
+            masked_embedding.build_centroid_weight(lm_head_weight)
         if masked_embedding.use_moe_backend:
             self._stable_full_lm_head_weight = None
 

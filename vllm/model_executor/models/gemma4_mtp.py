@@ -29,6 +29,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
+    get_tp_group,
     tensor_model_parallel_all_gather,
 )
 from vllm.logger import init_logger
@@ -123,12 +124,90 @@ def _decode_top_token(
     return out
 
 
+@triton.jit
+def _decode_local_top_token_kernel(
+    logits_ptr,
+    topk_ids_ptr,
+    token_ordering_ptr,
+    max_scores_ptr,
+    top_tokens_ptr,
+    num_selected,
+    TOP_K: tl.constexpr,
+    VOCAB_PER_CENTROID: tl.constexpr,
+    LOCAL_CENTROID_START: tl.constexpr,
+    LOCAL_NUM_CENTROIDS: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    route = offs // VOCAB_PER_CENTROID
+    centroids = tl.load(
+        topk_ids_ptr + row * TOP_K + route,
+        mask=route < TOP_K,
+        other=-1,
+    )
+    is_local = (centroids >= LOCAL_CENTROID_START) & (
+        centroids < LOCAL_CENTROID_START + LOCAL_NUM_CENTROIDS
+    )
+    vals = tl.load(
+        logits_ptr + row * num_selected + offs,
+        mask=(offs < num_selected) & is_local,
+        other=-float("inf"),
+    )
+    best = tl.argmax(vals, axis=0)
+    best_centroid = tl.load(
+        topk_ids_ptr + row * TOP_K + best // VOCAB_PER_CENTROID
+    )
+    vocab_id = tl.load(
+        token_ordering_ptr
+        + best_centroid.to(tl.int64) * VOCAB_PER_CENTROID
+        + best % VOCAB_PER_CENTROID
+    )
+    tl.store(max_scores_ptr + row, tl.max(vals))
+    tl.store(top_tokens_ptr + row, vocab_id)
+
+
+def _decode_local_top_token(
+    logits: torch.Tensor,
+    topk_ids: torch.Tensor,
+    token_ordering: torch.Tensor,
+    *,
+    local_centroid_start: int,
+    local_num_centroids: int,
+    vocab_size_per_centroid: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Mask remote routes and emit one local ``(score, token_id)`` pair."""
+    num_rows = logits.shape[0]
+    max_scores = torch.empty(
+        num_rows, dtype=logits.dtype, device=logits.device
+    )
+    top_tokens = torch.empty(
+        num_rows, dtype=token_ordering.dtype, device=logits.device
+    )
+    num_selected = topk_ids.shape[1] * vocab_size_per_centroid
+    _decode_local_top_token_kernel[(num_rows,)](
+        logits,
+        topk_ids,
+        token_ordering,
+        max_scores,
+        top_tokens,
+        num_selected,
+        topk_ids.shape[1],
+        vocab_size_per_centroid,
+        local_centroid_start,
+        local_num_centroids,
+        BLOCK=triton.next_power_of_2(num_selected),
+    )
+    return max_scores, top_tokens
+
+
 def _grouped_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
     topk_ids: torch.Tensor,
     top_k: int,
     num_experts: int,
+    expert_map: torch.Tensor | None = None,
     config_override: dict | None = None,
 ) -> torch.Tensor:
     """Single grouped GEMM: (T, K) x (E, N, K)[topk_ids] -> (T, top_k, N).
@@ -164,7 +243,18 @@ def _grouped_gemm(
         "num_warps": 4,
         "num_stages": 3,
     }
-    if num_experts >= _MOE_ALIGN_MAX_EXPERTS:
+    if expert_map is not None:
+        # Map global cluster ids to this rank's packed weights. The fused-MoE
+        # kernel treats -1 as a remote expert and skips that GEMM block.
+        sorted_ids = None
+        expert_ids = expert_map[topk_ids.long()].view(-1)
+        num_tokens_post_padded = torch.full(
+            (1,),
+            topk_ids.numel() * config["BLOCK_SIZE_M"],
+            dtype=torch.int32,
+            device=topk_ids.device,
+        )
+    elif num_experts >= _MOE_ALIGN_MAX_EXPERTS:
         # moe_align_block_size's CUDA kernel asserts padded_num_experts <
         # 1024, so the token-sorted path is unreachable here. Fall back to
         # naive block assignment (one block per (token, k) pair), which is
@@ -241,6 +331,8 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
         num_centroids: int,
         centroid_intermediate_top_k: int,
         prefix: str = "",
+        centroid_shard_rank: int = 0,
+        centroid_shard_size: int = 1,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -249,6 +341,17 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
         self.centroid_intermediate_top_k = centroid_intermediate_top_k
         self.vocab_size_per_centroid = vocab_size // num_centroids
         self.num_selected = centroid_intermediate_top_k * self.vocab_size_per_centroid
+        if num_centroids % centroid_shard_size != 0:
+            raise ValueError(
+                "Cluster-parallel sparse LM head requires num_centroids to be "
+                f"divisible by the shard size, got {num_centroids=} and "
+                f"{centroid_shard_size=}."
+            )
+        self.centroid_shard_rank = centroid_shard_rank
+        self.centroid_shard_size = centroid_shard_size
+        self.local_num_centroids = num_centroids // centroid_shard_size
+        self.local_centroid_start = centroid_shard_rank * self.local_num_centroids
+        self.local_centroid_end = self.local_centroid_start + self.local_num_centroids
 
         # out_dtype=None keeps the ReplicatedLinear fallback, matching the
         # previous nn.Linear numerics exactly. Every specialized GateLinear
@@ -264,11 +367,25 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
             "token_ordering",
             torch.empty(vocab_size, dtype=torch.long),
         )
+        expert_map = torch.full((num_centroids,), -1, dtype=torch.int32)
+        expert_map[self.local_centroid_start : self.local_centroid_end] = torch.arange(
+            self.local_num_centroids, dtype=torch.int32
+        )
+        self.register_buffer(
+            "centroid_expert_map",
+            expert_map,
+            persistent=False,
+        )
 
         self.use_moe_backend = envs.VLLM_GEMMA4_MTP_SPARSE_HEAD_BACKEND == "moe"
         # (num_centroids, vocab_size_per_centroid, hidden_size), built by
         # build_centroid_weight() once the LM head weights are loaded.
         self.centroid_weight: torch.Tensor | None = None
+
+    @property
+    def centroid_weight_is_sharded(self) -> bool:
+        """Whether packed token weights are partitioned by cluster."""
+        return self.centroid_shard_size > 1
 
     def build_centroid_weight(self, lm_head_weight: torch.Tensor) -> None:
         """Permute the LM head into centroid-major (E, N, K) layout.
@@ -279,10 +396,124 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
         """
         if not self.use_moe_backend or self.centroid_weight is not None:
             return
+        if self.centroid_weight_is_sharded:
+            raise RuntimeError(
+                "Use build_sharded_centroid_weight() for a cluster-parallel "
+                "sparse LM head."
+            )
         self.centroid_weight = (
             lm_head_weight[self.token_ordering]
             .view(self.num_centroids, self.vocab_size_per_centroid, -1)
             .contiguous()
+        )
+
+    def build_sharded_centroid_weight(
+        self,
+        local_lm_head_weight: torch.Tensor,
+        *,
+        vocab_start: int,
+        vocab_end: int,
+    ) -> None:
+        """Redistribute vocab-parallel rows into local cluster-major weights."""
+        if not self.use_moe_backend or self.centroid_weight is not None:
+            return
+        if not self.centroid_weight_is_sharded:
+            self.build_centroid_weight(local_lm_head_weight[: self.vocab_size])
+            return
+        if local_lm_head_weight.ndim != 2:
+            raise ValueError(
+                "Cluster-parallel sparse LM head requires a two-dimensional, "
+                f"unquantized LM-head weight, got {local_lm_head_weight.shape}."
+            )
+        local_vocab_size = vocab_end - vocab_start
+        if local_lm_head_weight.shape[0] < local_vocab_size:
+            raise ValueError(
+                "LM-head shard is smaller than its original-vocabulary range: "
+                f"rows={local_lm_head_weight.shape[0]}, range={local_vocab_size}."
+            )
+
+        device = local_lm_head_weight.device
+        token_to_cluster = torch.empty(
+            self.vocab_size, dtype=torch.long, device=device
+        )
+        token_to_slot = torch.empty_like(token_to_cluster)
+        ordered_tokens = self.token_ordering.view(
+            self.num_centroids, self.vocab_size_per_centroid
+        )
+        flat_ordering = ordered_tokens.reshape(-1)
+        token_to_cluster[flat_ordering] = torch.arange(
+            self.num_centroids, device=device
+        ).repeat_interleave(self.vocab_size_per_centroid)
+        token_to_slot[flat_ordering] = torch.arange(
+            self.vocab_size_per_centroid, device=device
+        ).repeat(self.num_centroids)
+
+        local_token_ids = torch.arange(vocab_start, vocab_end, device=device)
+        clusters = token_to_cluster[local_token_ids]
+        owners = torch.div(
+            clusters, self.local_num_centroids, rounding_mode="floor"
+        )
+        destination_rows = (
+            clusters.remainder(self.local_num_centroids)
+            * self.vocab_size_per_centroid
+            + token_to_slot[local_token_ids]
+        )
+        permutation = owners.argsort(stable=True)
+        owners = owners[permutation]
+        send_rows = destination_rows[permutation].contiguous()
+        send_weights = local_lm_head_weight[:local_vocab_size][permutation].contiguous()
+
+        send_counts = torch.bincount(
+            owners, minlength=self.centroid_shard_size
+        ).to(torch.int64)
+        all_send_counts = tensor_model_parallel_all_gather(send_counts, dim=0).view(
+            self.centroid_shard_size, self.centroid_shard_size
+        )
+        recv_counts = all_send_counts[:, self.centroid_shard_rank]
+        send_splits = send_counts.cpu().tolist()
+        recv_splits = recv_counts.cpu().tolist()
+        num_received = sum(recv_splits)
+
+        recv_rows = torch.empty(num_received, dtype=torch.long, device=device)
+        recv_weights = local_lm_head_weight.new_empty(
+            (num_received, local_lm_head_weight.shape[1])
+        )
+        tp_group = get_tp_group().device_group
+        torch.distributed.all_to_all_single(
+            recv_rows,
+            send_rows,
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+            group=tp_group,
+        )
+        torch.distributed.all_to_all_single(
+            recv_weights,
+            send_weights,
+            output_split_sizes=recv_splits,
+            input_split_sizes=send_splits,
+            group=tp_group,
+        )
+
+        expected_rows = self.local_num_centroids * self.vocab_size_per_centroid
+        if num_received != expected_rows:
+            raise RuntimeError(
+                "Cluster-parallel LM-head redistribution received the wrong "
+                f"number of rows: expected {expected_rows}, got {num_received}."
+            )
+        expected_indices = torch.arange(expected_rows, device=device)
+        if not torch.equal(recv_rows.sort().values, expected_indices):
+            raise RuntimeError(
+                "Cluster-parallel LM-head redistribution produced duplicate "
+                "or missing rows."
+            )
+        packed = local_lm_head_weight.new_empty(
+            (expected_rows, local_lm_head_weight.shape[1])
+        )
+        packed.index_copy_(0, recv_rows, recv_weights)
+        self.centroid_weight = packed.view(
+            self.local_num_centroids,
+            self.vocab_size_per_centroid,
+            self.hidden_size,
         )
 
     def _route(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -330,6 +561,8 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
     def _select_and_score_moe(
         self,
         hidden_states: torch.Tensor,
+        *,
+        mask_remote_routes: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Grouped-GEMM equivalent of ``_select_and_score``.
 
@@ -350,8 +583,20 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
             self.centroid_weight,
             top_k_indices,
             self.centroid_intermediate_top_k,
-            self.num_centroids,
+            (
+                self.local_num_centroids
+                if self.centroid_weight_is_sharded
+                else self.num_centroids
+            ),
+            expert_map=(
+                self.centroid_expert_map
+                if self.centroid_weight_is_sharded
+                else None
+            ),
         )
+        if self.centroid_weight_is_sharded and mask_remote_routes:
+            local_routes = self.centroid_expert_map[top_k_indices.long()] >= 0
+            logits.masked_fill_(~local_routes.unsqueeze(-1), -float("inf"))
         return logits, top_k_indices
 
     def forward(
@@ -373,11 +618,18 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
             logits, indices = self._select_and_score(hidden_states, lm_head_weight)
         output = torch.full(
             (num_tokens, self.vocab_size),
-            fill_value=torch.finfo(hidden_states.dtype).min,
+            fill_value=-float("inf"),
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
-        return output.scatter_(-1, indices, logits)
+        output.scatter_(-1, indices, logits)
+        if self.centroid_weight_is_sharded:
+            torch.distributed.all_reduce(
+                output,
+                op=torch.distributed.ReduceOp.MAX,
+                group=get_tp_group().device_group,
+            )
+        return output
 
     def get_top_tokens(
         self,
@@ -386,6 +638,33 @@ class Gemma4MTPMaskedEmbedder(nn.Module):
     ) -> torch.Tensor:
         """Sparse argmax — returns vocab token IDs without full-vocab tensor."""
         if self.use_moe_backend:
+            if self.centroid_weight_is_sharded:
+                logits, top_k_indices = self._select_and_score_moe(
+                    hidden_states,
+                    mask_remote_routes=False,
+                )
+                local_max, top_tokens = _decode_local_top_token(
+                    logits,
+                    top_k_indices,
+                    self.token_ordering,
+                    local_centroid_start=self.local_centroid_start,
+                    local_num_centroids=self.local_num_centroids,
+                    vocab_size_per_centroid=self.vocab_size_per_centroid,
+                )
+                local_pair = torch.stack(
+                    (local_max.float(), top_tokens.float()), dim=-1
+                )
+                gathered = tensor_model_parallel_all_gather(
+                    local_pair, dim=-1
+                ).view(hidden_states.shape[0], self.centroid_shard_size, 2)
+                winning_rank = gathered[:, :, 0].argmax(dim=-1, keepdim=True)
+                return (
+                    gathered[:, :, 1]
+                    .gather(dim=-1, index=winning_rank)
+                    .squeeze(-1)
+                    .to(torch.int64)
+                )
+
             logits, top_k_indices = self._select_and_score_moe(hidden_states)
             return _decode_top_token(
                 logits.view(hidden_states.shape[0], -1),
