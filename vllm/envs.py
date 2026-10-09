@@ -12,6 +12,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    VLLM_NEMOTRON_MTP_W4A16_LM_HEAD_PATH: str | None = None
     VLLM_HOST_IP: str = ""
     VLLM_PORT: int | None = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
@@ -607,6 +608,10 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    # Optional dense MTP NVFP4 weight-only LM-head sidecar (BF16 activations).
+    "VLLM_NEMOTRON_MTP_W4A16_LM_HEAD_PATH": lambda: os.getenv(
+        "VLLM_NEMOTRON_MTP_W4A16_LM_HEAD_PATH"
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]

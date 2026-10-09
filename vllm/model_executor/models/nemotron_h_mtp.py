@@ -4,13 +4,18 @@
 
 import typing
 from collections.abc import Callable, Iterable
+from pathlib import Path
 
 import torch
 import torch.nn as nn
+from safetensors.torch import load_file
 
+from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.config.parallel import ParallelConfig
+from vllm.logger import init_logger
+from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
 from vllm.model_executor.layers.fused_moe import (
     fused_moe_make_expert_params_mapping,
 )
@@ -18,8 +23,10 @@ from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
+    UnquantizedEmbeddingMethod,
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import (
@@ -40,6 +47,80 @@ from .nemotron_h import (
     NemotronHAttentionDecoderLayer,
     NemotronHMoEDecoderLayer,
 )
+
+logger = init_logger(__name__)
+
+
+class NemotronHDenseW4A16LMHeadMethod(QuantizeMethodBase):
+    """Load an NVFP4 sidecar and project BF16 activations with W4A16 GEMM."""
+
+    def __init__(self, artifact_path: str) -> None:
+        path = Path(artifact_path).expanduser()
+        if path.is_dir():
+            path = path / "lm_head_w4a16.safetensors"
+        if not path.is_file():
+            raise ValueError(f"W4A16 LM-head artifact does not exist: {path}")
+        self.artifact_path = path
+        self.kernel = init_nvfp4_linear_kernel(use_a16=True)
+
+    def create_weights(self, layer: nn.Module, *args, **kwargs) -> None:
+        UnquantizedEmbeddingMethod().create_weights(layer, *args, **kwargs)
+
+    def process_weights_after_loading(self, layer: nn.Module) -> None:
+        tensors = load_file(str(self.artifact_path), device="cpu")
+        vocab, hidden = layer.org_vocab_size, layer.embedding_dim
+        expected = {
+            "weight": ((vocab, hidden // 2), torch.uint8),
+            "weight_scale": ((vocab, hidden // 16), torch.float8_e4m3fn),
+            "weight_scale_2": ((1,), torch.float32),
+        }
+        for name, (shape, dtype) in expected.items():
+            value = tensors.get(name)
+            if value is None or tuple(value.shape) != shape or value.dtype != dtype:
+                actual = None if value is None else (value.shape, value.dtype)
+                raise ValueError(
+                    f"W4A16 LM-head {name} must have shape {shape} and dtype "
+                    f"{dtype}, got {actual}"
+                )
+        global_scale = tensors["weight_scale_2"]
+        if not torch.isfinite(global_scale).all() or not (global_scale > 0).all():
+            raise ValueError("W4A16 LM-head global scale must be finite and positive")
+
+        device = layer.weight.device
+        padded_vocab = layer.num_embeddings_per_partition
+        for name in ("weight", "weight_scale"):
+            value = tensors[name]
+            padded = torch.zeros(
+                (padded_vocab, value.shape[1]), dtype=value.dtype, device=device
+            )
+            padded[:vocab].copy_(value)
+            setattr(layer, name, nn.Parameter(padded, requires_grad=False))
+        layer.weight_global_scale = nn.Parameter(
+            global_scale.to(device), requires_grad=False
+        )
+        layer.input_size_per_partition = hidden
+        layer.output_size_per_partition = padded_vocab
+        self.kernel.process_weights_after_loading(layer)
+        logger.info(
+            "Loaded dense MTP W4A16 NVFP4 LM head from %s using %s "
+            "(BF16 activations, vocab=%d, hidden=%d).",
+            self.artifact_path,
+            type(self.kernel).__name__,
+            vocab,
+            hidden,
+        )
+
+    def apply(
+        self,
+        layer: nn.Module,
+        x: torch.Tensor,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if x.dtype != torch.bfloat16:
+            raise ValueError(
+                f"Dense MTP W4A16 requires BF16 activations, got {x.dtype}"
+            )
+        return self.kernel.apply_weights(layer, x, bias)
 
 
 class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
@@ -373,13 +454,24 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
         )
 
         # LM head for generating logits
-        self.has_own_lm_head = False
+        w4a16_path = envs.VLLM_NEMOTRON_MTP_W4A16_LM_HEAD_PATH
+        self.has_own_lm_head = bool(w4a16_path)
+        if w4a16_path:
+            if vllm_config.parallel_config.tensor_parallel_size != 1:
+                raise ValueError("Dense MTP W4A16 LM head currently requires TP=1")
+            if vllm_config.model_config.dtype != torch.bfloat16:
+                raise ValueError("Dense MTP W4A16 LM head requires a BF16 model")
+            if self.config.hidden_size % 16:
+                raise ValueError("NVFP4 LM-head hidden size must be divisible by 16")
         self.lm_head = ParallelLMHead(
             self.config.vocab_size,
             self.config.hidden_size,
-            quant_config=self.quant_config,
+            quant_config=None if w4a16_path else self.quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
+        if w4a16_path:
+            self.lm_head.quant_method = NemotronHDenseW4A16LMHeadMethod(w4a16_path)
+            self.lm_head.is_w4a16_nvfp4 = True
 
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
@@ -426,6 +518,11 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
         )
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def get_top_tokens(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Project draft hidden states and select tokens using local argmax."""
+        assert self.lm_head is not None, "lm_head not initialized"
+        return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load MTP weights with proper name remapping."""
         stacked_params_mapping = [
@@ -457,6 +554,9 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
             # in Multimodal Nemotron-H checkpoints.
             name = name.removeprefix("language_model.")
             is_lm_head_weight = name.startswith("lm_head.")
+            if is_lm_head_weight and getattr(self.lm_head, "is_w4a16_nvfp4", False):
+                # The sidecar supplies this head during post-load processing.
+                continue
             if is_lm_head_weight:
                 self.has_own_lm_head = True
             # Only process MTP and LM head weights -
@@ -558,7 +658,7 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        if not self.has_own_lm_head:
+        if not self.has_own_lm_head or getattr(self.lm_head, "is_w4a16_nvfp4", False):
             loaded_params.update(
                 name for name in params_dict if name.startswith("lm_head.")
             )
