@@ -21,6 +21,7 @@ from vllm.model_executor.models.gemma4_mtp import Gemma4MTPMaskedEmbedder
 from vllm.triton_utils import triton
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import get_open_port
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 
 def _initialize_single_gpu_model_parallel(
@@ -49,7 +50,10 @@ def _build_heads(
     benchmark_config: VllmConfig,
 ) -> tuple[Gemma4MTPMaskedEmbedder, ParallelLMHead, LogitsProcessor]:
     """Construct the production hierarchical and dense argmax paths."""
-    with set_current_vllm_config(benchmark_config):
+    with (
+        set_current_vllm_config(benchmark_config),
+        set_default_torch_dtype(lm_head_weight.dtype),
+    ):
         hierarchical_head = Gemma4MTPMaskedEmbedder(
             hidden_size=args.hidden_size,
             vocab_size=args.vocab_size,
