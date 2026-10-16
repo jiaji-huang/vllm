@@ -51,6 +51,7 @@ from .nemotron_h import (
 
 logger = init_logger(__name__)
 
+
 def _find_tensor(
     state_dict: dict[str, torch.Tensor], keys: tuple[str, ...]
 ) -> torch.Tensor | None:
@@ -78,6 +79,18 @@ def _resolve_clustered_lm_head_path(path: str) -> Path:
         raise FileNotFoundError(
             "VLLM_NEMOTRON_MTP_CLUSTERED_LM_HEAD_PATH does not exist or is not "
             f"a file: {checkpoint_path}"
+        )
+    return checkpoint_path
+
+
+def _resolve_nvfp4_lm_head_path(path: str) -> Path:
+    checkpoint_path = Path(path).expanduser()
+    if checkpoint_path.is_dir():
+        checkpoint_path = checkpoint_path / "lm_head_w4a16.safetensors"
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            "VLLM_NEMOTRON_MTP_NVFP4_LM_HEAD_PATH must point to an NVFP4 "
+            f"sidecar file or its containing directory: {checkpoint_path}"
         )
     return checkpoint_path
 
@@ -270,6 +283,85 @@ def _load_clustered_lm_head_sidecar(
     logger.info(
         "Loaded Nemotron-H MTP clustered LM-head sidecar from %s.",
         checkpoint_path,
+    )
+    return True
+
+
+def _load_nvfp4_lm_head_sidecar(
+    masked_embedding: Gemma4MTPMaskedEmbedder,
+) -> bool:
+    sidecar_path = envs.VLLM_NEMOTRON_MTP_NVFP4_LM_HEAD_PATH
+    if not sidecar_path:
+        return False
+    if not masked_embedding.use_moe_backend:
+        raise ValueError(
+            "VLLM_NEMOTRON_MTP_NVFP4_LM_HEAD_PATH requires the clustered "
+            "LM-head backend='moe' setting, which selects Triton FP4 for NVFP4."
+        )
+    checkpoint_path = _resolve_nvfp4_lm_head_path(sidecar_path)
+    state_dict = _load_clustered_lm_head_state(checkpoint_path)
+    weight = state_dict.get("weight")
+    weight_scale = state_dict.get("weight_scale")
+    weight_global_scale = state_dict.get("weight_scale_2")
+    if weight is None or weight_scale is None or weight_global_scale is None:
+        raise ValueError(
+            "NVFP4 LM-head sidecar must contain weight, weight_scale, and "
+            "weight_scale_2."
+        )
+
+    expected_weight_shape = (
+        masked_embedding.vocab_size,
+        masked_embedding.hidden_size // 2,
+    )
+    expected_scale_shape = (
+        masked_embedding.vocab_size,
+        masked_embedding.hidden_size // 16,
+    )
+    if weight.dtype != torch.uint8 or tuple(weight.shape) != expected_weight_shape:
+        raise ValueError(
+            "NVFP4 LM-head weight mismatch: expected uint8 "
+            f"{expected_weight_shape}, got {weight.dtype} {tuple(weight.shape)}."
+        )
+    if (
+        weight_scale.dtype != torch.float8_e4m3fn
+        or tuple(weight_scale.shape) != expected_scale_shape
+    ):
+        raise ValueError(
+            "NVFP4 LM-head weight_scale mismatch: expected float8_e4m3fn "
+            f"{expected_scale_shape}, got {weight_scale.dtype} "
+            f"{tuple(weight_scale.shape)}."
+        )
+    if weight_global_scale.dtype != torch.float32 or weight_global_scale.numel() != 1:
+        raise ValueError(
+            "NVFP4 LM-head weight_scale_2 must be one FP32 value, got "
+            f"{weight_global_scale.dtype} {tuple(weight_global_scale.shape)}."
+        )
+
+    token_ids = masked_embedding.token_ordering.detach().cpu().reshape(-1)
+    cluster_shape = (
+        masked_embedding.num_centroids,
+        masked_embedding.vocab_size_per_centroid,
+    )
+    cluster_weight = weight.index_select(0, token_ids).view(
+        *cluster_shape, masked_embedding.hidden_size // 2
+    )
+    cluster_scale = (
+        weight_scale.view(torch.uint8)
+        .index_select(0, token_ids)
+        .view(torch.float8_e4m3fn)
+        .view(*cluster_shape, masked_embedding.hidden_size // 16)
+    )
+    device = masked_embedding.centroids.weight.device
+    masked_embedding.build_nvfp4_centroid_weight(
+        cluster_weight.to(device=device),
+        cluster_scale.to(device=device),
+        weight_global_scale.to(device=device),
+    )
+    logger.info(
+        "Loaded Nemotron-H MTP native W4A4 NVFP4 LM-head sidecar from %s "
+        "(%d replicated clusters).",
+        checkpoint_path,
+        masked_embedding.num_centroids,
     )
     return True
 
@@ -724,10 +816,14 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
             return
 
         masked_embedding.centroid_weight = None
-        lm_head_weight = self._get_full_lm_head_weight()
+        masked_embedding.centroid_weight_scale = None
+        masked_embedding.centroid_weight_alpha = None
+        masked_embedding.centroid_activation_global_scale = None
         vocab_size_per_centroid = masked_embedding.vocab_size_per_centroid
+        sidecar_loaded = _load_clustered_lm_head_sidecar(masked_embedding)
 
-        if not _load_clustered_lm_head_sidecar(masked_embedding):
+        if not sidecar_loaded:
+            lm_head_weight = self._get_full_lm_head_weight()
             with torch.no_grad():
                 for centroid_idx in range(masked_embedding.num_centroids):
                     start = centroid_idx * vocab_size_per_centroid
@@ -735,6 +831,11 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
                     masked_embedding.centroids.weight[centroid_idx].copy_(
                         lm_head_weight[start:end].mean(dim=0)
                     )
+        if _load_nvfp4_lm_head_sidecar(masked_embedding):
+            self._stable_full_lm_head_weight = None
+            return
+
+        lm_head_weight = self._get_full_lm_head_weight()
         masked_embedding.build_centroid_weight(lm_head_weight)
         if masked_embedding.use_moe_backend:
             self._stable_full_lm_head_weight = None
@@ -773,6 +874,9 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
         self._stable_full_lm_head_weight = None
         if self.masked_embedding is not None:
             self.masked_embedding.centroid_weight = None
+            self.masked_embedding.centroid_weight_scale = None
+            self.masked_embedding.centroid_weight_alpha = None
+            self.masked_embedding.centroid_activation_global_scale = None
 
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

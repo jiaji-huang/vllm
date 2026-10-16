@@ -174,6 +174,7 @@ if TYPE_CHECKING:
     VLLM_NEMOTRON_MTP_LM_HEAD_NUM_CLUSTERS: int = 1024
     VLLM_NEMOTRON_MTP_LM_HEAD_CLUSTER_TOP_K: int = 1
     VLLM_NEMOTRON_MTP_CLUSTERED_LM_HEAD_PATH: str | None = None
+    VLLM_NEMOTRON_MTP_NVFP4_LM_HEAD_PATH: str | None = None
     VLLM_NEMOTRON_MTP_LM_HEAD_IMPL: str = "moe"
     VLLM_NEMOTRON_MTP_SPARSE_HEAD_BACKEND: str = "moe"
     VLLM_RAY_PER_WORKER_GPUS: float = 1.0
@@ -1470,6 +1471,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # directory containing model.pt, pytorch_model.bin, or model.safetensors.
     "VLLM_NEMOTRON_MTP_CLUSTERED_LM_HEAD_PATH": lambda: os.getenv(
         "VLLM_NEMOTRON_MTP_CLUSTERED_LM_HEAD_PATH"
+    ),
+    # Optional ModelOpt NVFP4 dense LM-head sidecar. On Blackwell, the
+    # clustered MoE backend runs it as native W4A4 after dynamically
+    # quantizing routed hidden states.
+    "VLLM_NEMOTRON_MTP_NVFP4_LM_HEAD_PATH": lambda: os.getenv(
+        "VLLM_NEMOTRON_MTP_NVFP4_LM_HEAD_PATH"
     ),
     # Older bench-job alias for the sparse-head backend.
     "VLLM_NEMOTRON_MTP_LM_HEAD_IMPL": lambda: os.getenv(

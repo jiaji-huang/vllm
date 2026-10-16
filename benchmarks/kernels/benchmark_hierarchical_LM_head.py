@@ -9,6 +9,7 @@ measurements do not continually route to the same cache-hot clusters.
 
 import torch
 
+from vllm import _custom_ops as ops
 from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
 from vllm.distributed import (
     init_distributed_environment,
@@ -21,6 +22,7 @@ from vllm.model_executor.models.gemma4_mtp import Gemma4MTPMaskedEmbedder
 from vllm.triton_utils import triton
 from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.utils.network_utils import get_open_port
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 
 def _initialize_single_gpu_model_parallel(
@@ -47,9 +49,17 @@ def _build_heads(
     centroid_signatures: torch.Tensor,
     token_ordering: torch.Tensor,
     benchmark_config: VllmConfig,
-) -> tuple[Gemma4MTPMaskedEmbedder, ParallelLMHead, LogitsProcessor]:
+) -> tuple[
+    Gemma4MTPMaskedEmbedder,
+    Gemma4MTPMaskedEmbedder | None,
+    ParallelLMHead,
+    LogitsProcessor,
+]:
     """Construct the production hierarchical and dense argmax paths."""
-    with set_current_vllm_config(benchmark_config):
+    with (
+        set_current_vllm_config(benchmark_config),
+        set_default_torch_dtype(lm_head_weight.dtype),
+    ):
         hierarchical_head = Gemma4MTPMaskedEmbedder(
             hidden_size=args.hidden_size,
             vocab_size=args.vocab_size,
@@ -64,6 +74,15 @@ def _build_heads(
             prefix="benchmark.lm_head",
         ).to(device=lm_head_weight.device)
         logits_processor = LogitsProcessor(args.vocab_size)
+        nvfp4_head = None
+        if args.nvfp4:
+            nvfp4_head = Gemma4MTPMaskedEmbedder(
+                hidden_size=args.hidden_size,
+                vocab_size=args.vocab_size,
+                num_centroids=args.num_centroids,
+                centroid_intermediate_top_k=args.top_k,
+                prefix="benchmark.nvfp4_embedding",
+            ).to(device=lm_head_weight.device, dtype=lm_head_weight.dtype)
 
     hierarchical_head.use_moe_backend = True
     with torch.no_grad():
@@ -71,7 +90,22 @@ def _build_heads(
         hierarchical_head.token_ordering.copy_(token_ordering)
         dense_head.weight_loader(dense_head.weight, lm_head_weight)
     hierarchical_head.build_centroid_weight(dense_head.weight)
-    return hierarchical_head, dense_head, logits_processor
+    if nvfp4_head is not None:
+        nvfp4_head.use_moe_backend = True
+        nvfp4_head.centroids.weight.copy_(centroid_signatures)
+        nvfp4_head.token_ordering.copy_(token_ordering)
+        global_scale = (448 * 6 / lm_head_weight.abs().max()).float().reshape(1)
+        packed, scales = ops.scaled_fp4_quant(
+            lm_head_weight, global_scale, is_sf_swizzled_layout=False
+        )
+        nvfp4_head.build_nvfp4_centroid_weight(
+            packed[token_ordering].view(args.num_centroids, -1, args.hidden_size // 2),
+            scales.view(torch.uint8)[token_ordering]
+            .view(torch.float8_e4m3fn)
+            .view(args.num_centroids, -1, args.hidden_size // 16),
+            global_scale.reciprocal(),
+        )
+    return hierarchical_head, nvfp4_head, dense_head, logits_processor
 
 
 def _hierarchical_top_tokens(
@@ -145,7 +179,7 @@ def main(args) -> None:
         dtype=dtype,
     )
     token_ordering = torch.randperm(args.vocab_size, device=device)
-    hierarchical_head, dense_head, logits_processor = _build_heads(
+    hierarchical_head, nvfp4_head, dense_head, logits_processor = _build_heads(
         args,
         lm_head_weight,
         centroid_signatures,
@@ -161,7 +195,11 @@ def main(args) -> None:
         f"({100.0 * num_selected / args.vocab_size:.2f}% of vocab) "
         f"input_pool={args.input_pool_size}"
     )
-    print(f"{'T':>6} {'hierarchical_ms':>16} {'dense_ms':>12} {'speedup':>10}")
+    extra_header = f" {'nvfp4_ms':>12}" if nvfp4_head is not None else ""
+    print(
+        f"{'T':>6} {'hierarchical_ms':>16} {'dense_ms':>12} "
+        f"{'speedup':>10}{extra_header}"
+    )
 
     for num_tokens in args.batch_sizes:
         input_pool = [
@@ -189,9 +227,19 @@ def main(args) -> None:
             rep_ms=args.rep_ms,
         )
         speedup = dense_ms / hierarchical_ms
+        extra_result = ""
+        if nvfp4_head is not None:
+            nvfp4_ms = _bench_input_pool(
+                _hierarchical_top_tokens,
+                input_pool,
+                nvfp4_head,
+                dense_head.weight,
+                rep_ms=args.rep_ms,
+            )
+            extra_result = f" {nvfp4_ms:>12.4f}"
         print(
             f"{num_tokens:>6} {hierarchical_ms:>16.4f} "
-            f"{dense_ms:>12.4f} {speedup:>9.2f}x"
+            f"{dense_ms:>12.4f} {speedup:>9.2f}x{extra_result}"
         )
 
 
@@ -215,4 +263,5 @@ if __name__ == "__main__":
         help="Approximate duration in milliseconds of each captured replay.",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--nvfp4", action="store_true", help="Also time routed W4A4.")
     main(parser.parse_args())

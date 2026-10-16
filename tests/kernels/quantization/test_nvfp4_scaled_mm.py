@@ -98,3 +98,77 @@ def test_nvfp4_gemm(
     )
 
     torch.testing.assert_close(out, expected_out.to(dtype=dtype), atol=1e-1, rtol=1e-1)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 4, 32])
+@pytest.mark.parametrize("n,k", [(32, 128), (32, 2688), (48, 272)])
+@torch.inference_mode()
+def test_nvfp4_routed_lm_head_matches_quantized_reference(num_tokens, n, k):
+    """Routes reuse token quantization and retain their original output order."""
+    from vllm.model_executor.models.gemma4_mtp import _grouped_gemm_nvfp4
+
+    set_random_seed(42)
+    num_experts, top_k = 7, 3
+    x = torch.randn(num_tokens, k, dtype=torch.bfloat16, device="cuda")
+    x[0].zero_()
+    w = torch.randn(num_experts * n, k, dtype=x.dtype, device=x.device)
+    activation_scale = torch.tensor([2.0], device=x.device)
+    weight_quant_scale = torch.tensor([3.0], device=x.device)
+    a_fp4, a_scale = ops.scaled_fp4_quant(
+        x, activation_scale, is_sf_swizzled_layout=False
+    )
+    b_fp4, b_scale = ops.scaled_fp4_quant(
+        w, weight_quant_scale, is_sf_swizzled_layout=False
+    )
+    ids = torch.randint(num_experts, (num_tokens, top_k), device=x.device).int()
+    alpha = torch.full((num_experts,), 1 / 3, device=x.device)
+    a_ref = dequantize_nvfp4_to_dtype(
+        a_fp4,
+        a_scale,
+        activation_scale,
+        torch.float32,
+        x.device,
+        is_sf_linear_layout=True,
+    )
+    b_ref = dequantize_nvfp4_to_dtype(
+        b_fp4,
+        b_scale,
+        weight_quant_scale,
+        torch.float32,
+        x.device,
+        is_sf_linear_layout=True,
+    ).view(num_experts, n, k)
+    expected = torch.einsum("tk,tsnk->tsn", a_ref, b_ref[ids.long()])
+    actual = _grouped_gemm_nvfp4(
+        x,
+        b_fp4.view(num_experts, n, k // 2),
+        b_scale.view(num_experts, n, k // 16),
+        alpha,
+        activation_scale,
+        ids,
+        top_k,
+        num_experts,
+    )
+    assert actual.shape == (num_tokens, top_k, n)
+    assert actual.is_contiguous()
+    torch.testing.assert_close(actual, expected.to(x.dtype), rtol=1e-2, atol=1e-2)
+
+    if (num_tokens, n, k) == (4, 32, 2688):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = _grouped_gemm_nvfp4(
+                x,
+                b_fp4.view(num_experts, n, k // 2),
+                b_scale.view(num_experts, n, k // 16),
+                alpha,
+                activation_scale,
+                ids,
+                top_k,
+                num_experts,
+            )
+        x.mul_(2)
+        ids.copy_(ids.flip(1))
+        graph.replay()
+        torch.testing.assert_close(
+            captured, (expected.flip(1) * 2).to(x.dtype), rtol=1e-2, atol=1e-2
+        )
