@@ -1524,7 +1524,7 @@ class SpecDecodeBaseProposer:
                 )
             elif (
                 not getattr(
-                    getattr(self.model, "lm_head", None), "is_w4a16_nvfp4", False
+                    getattr(self.model, "lm_head", None), "is_nvfp4_lm_head", False
                 )
                 and hasattr(target_language_model, "lm_head")
                 and hasattr(target_language_model.lm_head, "weight")

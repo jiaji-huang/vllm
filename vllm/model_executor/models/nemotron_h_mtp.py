@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """NemotronH-MTP model with attention layers."""
 
+import math
 import typing
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -51,17 +52,52 @@ from .nemotron_h import (
 logger = init_logger(__name__)
 
 
-class NemotronHDenseW4A16LMHeadMethod(QuantizeMethodBase):
-    """Load an NVFP4 sidecar and project BF16 activations with W4A16 GEMM."""
+class NemotronHDenseNvFp4LMHeadMethod(QuantizeMethodBase):
+    """Dense artifact-backed NVFP4 projection with BF16 or FP4 activations."""
 
-    def __init__(self, artifact_path: str) -> None:
+    def __init__(
+        self,
+        artifact_path: str,
+        *,
+        use_a16: bool = True,
+        activation_global_scale: float = 1.0,
+    ) -> None:
+        if not math.isfinite(activation_global_scale) or activation_global_scale <= 0:
+            raise ValueError("Activation global scale must be finite and positive")
+        self.use_a16 = use_a16
+        self.precision = "W4A16" if use_a16 else "W4A4"
+        self.activation_global_scale = activation_global_scale
         path = Path(artifact_path).expanduser()
         if path.is_dir():
             path = path / "lm_head_w4a16.safetensors"
         if not path.is_file():
-            raise ValueError(f"W4A16 LM-head artifact does not exist: {path}")
+            raise ValueError(f"NVFP4 LM-head artifact does not exist: {path}")
         self.artifact_path = path
-        self.kernel = init_nvfp4_linear_kernel(use_a16=True)
+        self.kernel = init_nvfp4_linear_kernel(use_a16=use_a16)
+        if not use_a16:
+            from vllm.model_executor.kernels.linear.nvfp4.cutlass import (
+                CutlassNvFp4LinearKernel,
+            )
+            from vllm.model_executor.kernels.linear.nvfp4.flashinfer import (
+                FlashInferB12xNvFp4LinearKernel,
+                FlashInferCudnnNvFp4LinearKernel,
+                FlashInferCuteDslNvFp4LinearKernel,
+                FlashInferCutlassNvFp4LinearKernel,
+                FlashInferTrtllmNvFp4LinearKernel,
+            )
+
+            if not isinstance(
+                self.kernel,
+                (
+                    CutlassNvFp4LinearKernel,
+                    FlashInferCuteDslNvFp4LinearKernel,
+                    FlashInferCutlassNvFp4LinearKernel,
+                    FlashInferTrtllmNvFp4LinearKernel,
+                    FlashInferCudnnNvFp4LinearKernel,
+                    FlashInferB12xNvFp4LinearKernel,
+                ),
+            ):
+                raise ValueError("Dense W4A4 requires a native NVFP4 GEMM backend")
 
     def create_weights(self, layer: nn.Module, *args, **kwargs) -> None:
         UnquantizedEmbeddingMethod().create_weights(layer, *args, **kwargs)
@@ -79,12 +115,12 @@ class NemotronHDenseW4A16LMHeadMethod(QuantizeMethodBase):
             if value is None or tuple(value.shape) != shape or value.dtype != dtype:
                 actual = None if value is None else (value.shape, value.dtype)
                 raise ValueError(
-                    f"W4A16 LM-head {name} must have shape {shape} and dtype "
+                    f"NVFP4 LM-head {name} must have shape {shape} and dtype "
                     f"{dtype}, got {actual}"
                 )
         global_scale = tensors["weight_scale_2"]
         if not torch.isfinite(global_scale).all() or not (global_scale > 0).all():
-            raise ValueError("W4A16 LM-head global scale must be finite and positive")
+            raise ValueError("NVFP4 LM-head global scale must be finite and positive")
 
         device = layer.weight.device
         padded_vocab = layer.num_embeddings_per_partition
@@ -100,14 +136,33 @@ class NemotronHDenseW4A16LMHeadMethod(QuantizeMethodBase):
         )
         layer.input_size_per_partition = hidden
         layer.output_size_per_partition = padded_vocab
+        if not self.use_a16:
+            # Global scales are dequantization multipliers; the quantizer takes
+            # their reciprocal. Per-16-element activation scales remain dynamic.
+            layer.input_global_scale = nn.Parameter(
+                torch.tensor(
+                    [self.activation_global_scale], device=device, dtype=torch.float32
+                ),
+                requires_grad=False,
+            )
+            layer.input_global_scale_inv = nn.Parameter(
+                layer.input_global_scale.reciprocal(),
+                requires_grad=False,
+            )
+            layer.alpha = nn.Parameter(
+                layer.input_global_scale * layer.weight_global_scale,
+                requires_grad=False,
+            )
         self.kernel.process_weights_after_loading(layer)
         logger.info(
-            "Loaded dense MTP W4A16 NVFP4 LM head from %s using %s "
-            "(BF16 activations, vocab=%d, hidden=%d).",
+            "Loaded dense MTP %s NVFP4 LM head from %s using %s "
+            "(BF16 input, vocab=%d, hidden=%d, activation_global_scale=%g).",
+            self.precision,
             self.artifact_path,
             type(self.kernel).__name__,
             vocab,
             hidden,
+            self.activation_global_scale,
         )
 
     def apply(
@@ -117,10 +172,12 @@ class NemotronHDenseW4A16LMHeadMethod(QuantizeMethodBase):
         bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if x.dtype != torch.bfloat16:
-            raise ValueError(
-                f"Dense MTP W4A16 requires BF16 activations, got {x.dtype}"
-            )
+            raise ValueError(f"Dense MTP NVFP4 requires BF16 input, got {x.dtype}")
         return self.kernel.apply_weights(layer, x, bias)
+
+
+class NemotronHDenseW4A16LMHeadMethod(NemotronHDenseNvFp4LMHeadMethod):
+    """Compatibility adapter for the existing dense W4A16 path."""
 
 
 class NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer):
@@ -455,12 +512,15 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
 
         # LM head for generating logits
         w4a16_path = envs.VLLM_NEMOTRON_MTP_W4A16_LM_HEAD_PATH
+        activation_bits = envs.VLLM_NEMOTRON_MTP_NVFP4_ACTIVATION_BITS
+        if activation_bits not in (4, 16):
+            raise ValueError("NVFP4 LM-head activation bits must be 4 or 16")
         self.has_own_lm_head = bool(w4a16_path)
         if w4a16_path:
             if vllm_config.parallel_config.tensor_parallel_size != 1:
-                raise ValueError("Dense MTP W4A16 LM head currently requires TP=1")
+                raise ValueError("Dense MTP NVFP4 LM head currently requires TP=1")
             if vllm_config.model_config.dtype != torch.bfloat16:
-                raise ValueError("Dense MTP W4A16 LM head requires a BF16 model")
+                raise ValueError("Dense MTP NVFP4 LM head requires a BF16 model")
             if self.config.hidden_size % 16:
                 raise ValueError("NVFP4 LM-head hidden size must be divisible by 16")
         self.lm_head = ParallelLMHead(
@@ -470,8 +530,14 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         if w4a16_path:
-            self.lm_head.quant_method = NemotronHDenseW4A16LMHeadMethod(w4a16_path)
-            self.lm_head.is_w4a16_nvfp4 = True
+            self.lm_head.quant_method = NemotronHDenseNvFp4LMHeadMethod(
+                w4a16_path,
+                use_a16=activation_bits == 16,
+                activation_global_scale=(
+                    envs.VLLM_NEMOTRON_MTP_NVFP4_ACTIVATION_GLOBAL_SCALE
+                ),
+            )
+            self.lm_head.is_nvfp4_lm_head = True
 
         self.logits_processor = LogitsProcessor(self.config.vocab_size)
 
@@ -554,7 +620,7 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
             # in Multimodal Nemotron-H checkpoints.
             name = name.removeprefix("language_model.")
             is_lm_head_weight = name.startswith("lm_head.")
-            if is_lm_head_weight and getattr(self.lm_head, "is_w4a16_nvfp4", False):
+            if is_lm_head_weight and getattr(self.lm_head, "is_nvfp4_lm_head", False):
                 # The sidecar supplies this head during post-load processing.
                 continue
             if is_lm_head_weight:
@@ -658,7 +724,7 @@ class NemotronHMTP(nn.Module, SupportsPP, SupportsQuant):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
 
-        if not self.has_own_lm_head or getattr(self.lm_head, "is_w4a16_nvfp4", False):
+        if not self.has_own_lm_head or getattr(self.lm_head, "is_nvfp4_lm_head", False):
             loaded_params.update(
                 name for name in params_dict if name.startswith("lm_head.")
             )
