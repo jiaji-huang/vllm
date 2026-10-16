@@ -12,6 +12,9 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
+    VLLM_NEMOTRON_MTP_W4A16_LM_HEAD_PATH: str | None = None
+    VLLM_NEMOTRON_MTP_NVFP4_ACTIVATION_BITS: int = 16
+    VLLM_NEMOTRON_MTP_NVFP4_ACTIVATION_GLOBAL_SCALE: float = 1.0
     VLLM_HOST_IP: str = ""
     VLLM_PORT: int | None = None
     VLLM_RPC_BASE_PATH: str = tempfile.gettempdir()
@@ -615,6 +618,17 @@ def _resolve_rust_cli_path() -> str | None:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_NEMOTRON_MTP_NVFP4_ACTIVATION_BITS": lambda: int(
+        os.getenv("VLLM_NEMOTRON_MTP_NVFP4_ACTIVATION_BITS", "16")
+    ),
+    # Activation dequantization scale; 1.0 is an uncalibrated default.
+    "VLLM_NEMOTRON_MTP_NVFP4_ACTIVATION_GLOBAL_SCALE": lambda: float(
+        os.getenv("VLLM_NEMOTRON_MTP_NVFP4_ACTIVATION_GLOBAL_SCALE", "1.0")
+    ),
+    # Optional dense MTP NVFP4 weight-only LM-head sidecar (BF16 activations).
+    "VLLM_NEMOTRON_MTP_W4A16_LM_HEAD_PATH": lambda: os.getenv(
+        "VLLM_NEMOTRON_MTP_W4A16_LM_HEAD_PATH"
+    ),
     # ================== Installation Time Env Vars ==================
     # Target device of vLLM, supporting [cuda (by default),
     # rocm, cpu]
