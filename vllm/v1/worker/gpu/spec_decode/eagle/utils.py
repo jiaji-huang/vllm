@@ -45,8 +45,10 @@ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
 def share_target_lm_head(
     draft_model: nn.Module,
     target_lm_head: nn.Module | None,
-    quantization: Literal["fp8", "nvfp4"] | None,
+    quantization: Literal["fp8", "nvfp4", "nvfp4_w4a4"] | None,
     can_share: bool = True,
+    *,
+    quantization_path: str | None = None,
 ) -> nn.Module | None:
     """Install the target lm_head, or its quantized copy, on a drafter that
     shares it. Returns the installed head, or None if the drafter keeps its own.
@@ -65,10 +67,13 @@ def share_target_lm_head(
         return None
     head = target_lm_head
     if quantization is not None:
-        head = quantized_lm_head_copy(target_lm_head, quantization)
+        head = quantized_lm_head_copy(target_lm_head, quantization, quantization_path)
     if draft_lm_head is not None:
         del draft_model.lm_head
     draft_model.lm_head = head
+    prepare_head = getattr(draft_model, "prepare_hierarchical_lm_head", None)
+    if prepare_head is not None:
+        prepare_head()
     return head
 
 
@@ -146,6 +151,7 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
         eagle_model,
         get_target_lm_head(target_model, target_language_model),
         speculative_config.draft_lm_head_quantization,
+        quantization_path=speculative_config.draft_lm_head_quantization_path,
     )
     if draft_head is not None:
         # MTP layers route logits through layer.shared_head.head, not

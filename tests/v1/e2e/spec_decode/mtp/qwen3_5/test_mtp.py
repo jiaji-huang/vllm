@@ -215,8 +215,11 @@ def test_mtp_draft_lm_head_quantization(
     greedy outputs match stock MTP and acceptance stays within 10%."""
     prompts = get_test_prompts(mm_enabled=False)
     results = {}
-    # NVFP4 needs a CUDA W4A16 kernel.
-    quants = (None, "fp8", "nvfp4") if current_platform.is_cuda() else (None, "fp8")
+    quants = [None, "fp8"]
+    if current_platform.is_cuda():
+        quants.append("nvfp4")
+        if current_platform.has_device_capability(100):
+            quants.append("nvfp4_w4a4")
     for quant in quants:
         with vllm_runner(
             "Qwen/Qwen3.5-0.8B-Base",

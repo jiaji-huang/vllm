@@ -75,7 +75,7 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
 - If your model does not support MTP, use another method such as EAGLE or draft
   model speculation.
 - When the MTP head shares the target's unquantized lm_head (most MTP models),
-  `"draft_lm_head_quantization": "fp8"` or `"nvfp4"` in `--speculative-config`
+  `"draft_lm_head_quantization": "fp8"`, `"nvfp4"`, or `"nvfp4_w4a4"` in `--speculative-config`
   gives the drafter a quantized copy of that head (Model Runner V2). The target
   still verifies with its own head, so outputs are unchanged; only the
   acceptance length can move. It helps most on bandwidth-bound GPUs with a
@@ -83,3 +83,46 @@ vllm serve XiaomiMiMo/MiMo-7B-Base \
   per lm_head weight, e.g. 0.6 or 0.35 GiB for a 248k x 2560 head; it is
   counted in the model weights, so with `--kv-cache-memory-bytes` leave room
   for it.
+
+### Dense NVFP4 draft head
+
+`draft_lm_head_quantization="nvfp4"` keeps activations in the model dtype
+(W4A16). `"nvfp4_w4a4"` quantizes activations dynamically in blocks of 16 and
+uses a native FP4 tensor-core kernel (SM100+ hardware). Its activation global
+scale is 1.0, matching the earlier dense Nemotron experiment. The two modes
+share the same weight quantization; they do not quantize the target head.
+Weights are quantized once from the loaded BF16/FP16 target by default, without
+calibration data. Kernel selection follows `--linear-backend`.
+
+To reuse an existing NVFP4 artifact at TP=1, also set
+`draft_lm_head_quantization_path` to its file or directory. A directory resolves
+to `lm_head_w4a16.safetensors`, containing `weight` (packed uint8 E2M1),
+`weight_scale` (logical E4M3 scales per 16 weights), and `weight_scale_2`
+(one positive FP32 dequantization scale). Vocabulary padding is applied at
+load time. Reloading an artifact-backed copy rereads that artifact; update the
+artifact as well when changing source weights. Reloads preserve graph storage.
+The option is supported wherever a target LM head can be shared by the draft.
+
+For example:
+
+```bash
+vllm serve nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16 \
+  --tensor-parallel-size 1 \
+  --kernel-config '{"linear_backend_per_quant":{"nvfp4_w4a16":"flashinfer_cutedsl","nvfp4_w4a4":"flashinfer_cutedsl"}}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":7,"draft_lm_head_quantization":"nvfp4_w4a4","draft_lm_head_quantization_path":"./quantized/nm3.5nano/"}'
+```
+
+In the parent project's single-GPU E2E launcher, the earlier artifact-backed
+commands are supported again:
+
+```bash
+sbatch job_Nemotron35_MTP_hierarchical_AL_singleGPU.sh \
+  ./quantized/nm3.5nano/ 1 logs/dense_w4a16_1
+sbatch job_Nemotron35_MTP_hierarchical_AL_singleGPU.sh \
+  --w4a4 ./quantized/nm3.5nano/ 1 logs/dense_w4a4_1
+```
+
+Both launcher modes select FlashInfer CuTe DSL through NVFP4-specific backend
+overrides, preserving the target backbone's BF16 kernel selection. For
+quantization at load time,
+replace the artifact argument with `--w4a16`, or omit it after `--w4a4`.

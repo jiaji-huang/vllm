@@ -142,6 +142,7 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         get_target_lm_head(target_model, target_language_model),
         speculative_config.draft_lm_head_quantization,
         can_share=draft_output_vocab_size == target_vocab_size,
+        quantization_path=speculative_config.draft_lm_head_quantization_path,
     )
 
     return draft_model

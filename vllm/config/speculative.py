@@ -132,6 +132,7 @@ _QWEN3_OMNI_DSPARK_ARCHITECTURE = "Qwen3OmniDSparkModel"
 _METHOD_SPECIFIC_OPTIONS = (
     "dspark_draft_topk",
     "draft_lm_head_quantization",
+    "draft_lm_head_quantization_path",
     "index_share_for_mtp_iteration",
     "xpress_topc",
     "speculator_options",
@@ -553,12 +554,17 @@ class SpeculativeConfig:
     also cover the tokens the drafter reads after each block, so engines
     sharing a KV store and external consumers of KV cache events must use the
     same setting."""
-    draft_lm_head_quantization: Literal["fp8", "nvfp4"] | None = None
+    draft_lm_head_quantization: Literal["fp8", "nvfp4", "nvfp4_w4a4"] | None = None
     """Quantize the drafter's copy of a target lm_head it shares (EAGLE, MTP
     and DeepSeek-V4/V4.1 DSpark). "fp8" uses per-row weight and per-token
     activation scales on the platform's FP8 linear kernel; "nvfp4" is
     weight-only on the platform's W4A16 kernel. The target verifies with its
-    own head, so only the acceptance length can change."""
+    own head, so only the acceptance length can change. "nvfp4_w4a4" uses
+    native FP4 tensor cores with quantized activations (global scale 1.0)."""
+    draft_lm_head_quantization_path: str | None = None
+    """Optional NVFP4 artifact file or directory containing
+    lm_head_w4a16.safetensors. Supports nvfp4 and nvfp4_w4a4 at TP=1.
+    Otherwise weights are quantized from the loaded target head."""
     use_local_argmax_reduction: bool = False
     """Use vocab-parallel local argmax instead of all-gathering full logits
     for draft token generation. Reduces communication from O(vocab_size) to
@@ -751,6 +757,7 @@ class SpeculativeConfig:
             "disable_eagle_block_drop",
             "disable_lookahead_block_hashes",
             "draft_lm_head_quantization",
+            "draft_lm_head_quantization_path",
             "use_local_argmax_reduction",
             "prompt_lookup_max",
             "prompt_lookup_min",
@@ -1416,6 +1423,11 @@ class SpeculativeConfig:
         )
 
     def __post_init__(self):
+        if (
+            self.draft_lm_head_quantization_path is not None
+            and self.draft_lm_head_quantization not in ("nvfp4", "nvfp4_w4a4")
+        ):
+            raise ValueError("draft_lm_head_quantization_path requires NVFP4")
         # Note: "method" is a new parameter that helps to extend the
         # configuration of non-model-based proposers, and the "model" parameter
         # will be used to set the draft model, eagle head, or additional weight

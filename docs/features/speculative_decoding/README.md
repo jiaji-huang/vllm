@@ -20,6 +20,7 @@ vLLM supports a variety of methods of speculative decoding. Model-based methods 
 - [Adaptive Verification](adaptive_verification.md)
 - [FLy Verification (Lossy)](fly.md)
 - [Per-Request Acceptance Metrics](acceptance_metrics.md)
+- [Hierarchical LM Head Backends (Experimental)](hierarchical_lm_head.md)
 
 ## Method Selection at a Glance
 

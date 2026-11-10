@@ -344,3 +344,138 @@ def test_quantize_to_fp4_padded_no_sf_swizzled(pad_shape: tuple[int, int]) -> No
     out_ans = cast_from_fp4(out, m, n)
     torch.testing.assert_close(out_ans, out_ref)
     torch.testing.assert_close(scale_ans, scale_ref)
+
+
+
+@pytest.mark.parametrize("backend", ["compiled", "moe"])
+@torch.inference_mode()
+def test_hierarchical_nvfp4_router_keeps_bf16_scoring(backend: str) -> None:
+    """Exact FP4 inputs isolate routing, scoring and graph-safe reload behavior."""
+    from vllm.model_executor.layers.hierarchical_lm_head import HierarchicalLMHead
+
+    torch.manual_seed(4)
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    head = HierarchicalLMHead(
+        128, 256, 128, 2, backend=backend, router_precision="w4a4"
+    ).to(device="cuda", dtype=torch.bfloat16)
+    # Global weight scale 1 and block scales 448 are exactly representable.
+    signatures = lut[torch.randint(0, 16, (128, 128), device="cuda")] * 448
+    signatures[:, ::16] = 2688
+    head.centroids.weight.copy_(signatures)
+    weight = torch.randint(-8, 9, (256, 128), device="cuda").to(torch.bfloat16)
+    original = weight.clone()
+    head.prepare_weights(weight)
+    assert set(head.state_dict()) == {"centroids.weight", "token_ordering"}
+    hidden = lut.repeat(3, 8)
+
+    def reference():
+        scores = head.centroids(hidden)
+        ids = head.token_ordering.reshape(128, 2)[scores.topk(2).indices].reshape(3, 4)
+        values = (weight[ids].float() * hidden[:, None, :].float()).sum(-1)
+        result = hidden.new_full((3, 256), torch.finfo(hidden.dtype).min)
+        return result.scatter_(-1, ids, values.to(hidden.dtype))
+
+    torch.testing.assert_close(
+        head.router_logits(hidden), head.centroids(hidden), atol=0, rtol=0
+    )
+    torch.testing.assert_close(head(hidden, weight), reference(), atol=0, rtol=0)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = head(hidden, weight)
+    hidden.copy_(hidden.roll(1, dims=1))
+    head.centroids.weight.copy_(head.centroids.weight.roll(1, dims=0))
+    head.prepare_weights(weight)
+    graph.replay()
+    torch.testing.assert_close(captured, reference(), atol=0, rtol=0)
+    torch.testing.assert_close(weight, original, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("quantization", ["nvfp4", "nvfp4_w4a4"])
+@pytest.mark.parametrize("artifact", [False, True])
+@torch.inference_mode()
+def test_dense_draft_nvfp4_preserves_source_and_graphs(
+    default_vllm_config, dist_init, tmp_path, quantization, artifact
+):
+    """Exactly representable operands expose scale and padded-vocab mistakes."""
+    import json
+
+    from safetensors.torch import save_file
+
+    from vllm.config import ModelConfig
+    from vllm.model_executor.layers.logits_processor import LogitsProcessor
+    from vllm.model_executor.layers.quantization.online.lm_head import (
+        _quantize_nvfp4,
+        quantized_lm_head_copy,
+        refresh_quantized_lm_heads,
+    )
+    from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+
+    model_config = {
+        "model_type": "llama",
+        "architectures": ["LlamaForCausalLM"],
+        "vocab_size": 250,
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 2048,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(model_config))
+    default_vllm_config.model_config = ModelConfig(
+        model=str(tmp_path), dtype="bfloat16", skip_tokenizer_init=True
+    )
+    default_vllm_config.kernel_config.linear_backend_per_quant = {
+        "nvfp4_w4a16": "flashinfer_cutedsl",
+        "nvfp4_w4a4": "flashinfer_cutedsl",
+    }
+    torch.manual_seed(42)
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    with torch.device("cuda"):
+        source = ParallelLMHead(250, 128, disable_tp=True, params_dtype=torch.bfloat16)
+    weight = lut[torch.randint(0, 16, source.weight.shape, device="cuda")] * 224
+    weight[:, ::16] = 1344  # Exact block scale 448 and non-unit global scale .5.
+    source.weight.copy_(weight)
+    original = source.weight.clone()
+    if artifact:
+        packed, scales, global_scale = _quantize_nvfp4(source.weight[:250])
+        save_file(
+            {
+                "weight": packed.cpu(),
+                "weight_scale": scales.cpu(),
+                "weight_scale_2": global_scale.reshape(1).cpu(),
+            },
+            str(tmp_path / "lm_head_w4a16.safetensors"),
+        )
+    drafter = torch.nn.Module()
+    drafter.lm_head = quantized_lm_head_copy(
+        source, quantization, str(tmp_path) if artifact else None
+    )
+    torch.testing.assert_close(source.weight, original, atol=0, rtol=0)
+    assert drafter.lm_head.weight.dtype == torch.uint8
+    processor = LogitsProcessor(250)
+    hidden = lut.repeat(3, 8)
+    torch.testing.assert_close(
+        processor(drafter.lm_head, hidden), processor(source, hidden), atol=0, rtol=0
+    )
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = processor(drafter.lm_head, hidden)
+    pointers = {name: p.data_ptr() for name, p in drafter.lm_head.named_parameters()}
+    hidden.copy_(hidden.roll(1, dims=1))
+    refresh_quantized_lm_heads(drafter)
+    graph.replay()
+    assert pointers == {
+        name: p.data_ptr() for name, p in drafter.lm_head.named_parameters()
+    }
+    torch.testing.assert_close(captured, processor(source, hidden), atol=0, rtol=0)

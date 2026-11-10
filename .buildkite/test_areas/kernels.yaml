@@ -44,6 +44,11 @@ steps:
   - tests/kernels/test_concat_mla_q.py
   - tests/kernels/test_fused_qk_norm_rope_gate.py
   - vllm/model_executor/layers/fused_qk_norm_rope.py
+  - vllm/model_executor/layers/hierarchical_lm_head.py
+  - vllm/model_executor/models/gemma4_mtp.py
+  - vllm/model_executor/models/nemotron_h_mtp.py
+  - tests/kernels/test_hierarchical_lm_head.py
+  - vllm/v1/worker/gpu/spec_decode/eagle/utils.py
   commands:
     - >-
       pytest -v -s
@@ -51,6 +56,7 @@ steps:
       --ignore=kernels/core/test_minimax_reduce_rms.py
       kernels/test_concat_mla_q.py
       kernels/test_fused_qk_norm_rope_gate.py
+      kernels/test_hierarchical_lm_head.py
   mirror:
     amd:
       label: ":amd: (MI300) Core Operation Kernels"
@@ -815,6 +821,13 @@ steps:
   device: b200-k8s
   # optional: true
   source_file_dependencies:
+  - vllm/model_executor/layers/hierarchical_lm_head.py
+  - vllm/model_executor/layers/quantization/online/lm_head.py
+  - vllm/config/speculative.py
+  - vllm/v1/worker/gpu/spec_decode/eagle/
+  - vllm/model_executor/models/nemotron_h_mtp.py
+  - vllm/model_executor/models/gemma4_mtp.py
+  - tests/kernels/quantization/test_nvfp4_quant.py
   - csrc/quantization/fp4/
   - csrc/nvfp4_kv_cache_kernels.cu
   - csrc/quantization/w8a8/cutlass/
